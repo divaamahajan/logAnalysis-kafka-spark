@@ -1,133 +1,89 @@
 from pyspark.sql import SparkSession
-from pyspark.streaming import StreamingContext
-from pyspark.sql.functions import regexp_extract
-from pyspark import SparkContext
-from pyspark.sql.types import StringType
-# Import the KafkaConsumer from confluent_kafka
-from confluent_kafka import KafkaException, KafkaError
-from confluent_kafka import Consumer, KafkaError
-
-# Function to process the log lines RDD
-from pyspark.sql.functions import regexp_extract
-from pyspark.sql.functions import year, month, dayofmonth, hour, minute, second
-
-# Specify the Kafka broker and topic to consume from
-brokers = 'localhost:9092'
-topic = 'log_lines_topic'
-def process_logs(rdd):
-    if not rdd.isEmpty():
-        # Convert RDD to DataFrame
-        logs_df = spark.read.json(rdd)
-
-        # Data wrangling steps
-        host_pattern = r'(^\S+\.[\S+\.]+\S+)\s'
-        ts_pattern = r'\[(\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2} -\d{4})]'
-        method_uri_protocol_pattern = r'\"(\S+)\s(\S+)\s*(\S*)\"'
-        status_pattern = r'\s(\d{3})\s'
-        content_size_pattern = r'\s(\d+)$'
-
-        logs_df = logs_df.withColumn('host', regexp_extract('value', host_pattern, 1))
-        logs_df = logs_df.withColumn('timestamp', regexp_extract('value', ts_pattern, 1))
-        logs_df = logs_df.withColumn('method', regexp_extract('value', method_uri_protocol_pattern, 1))
-        logs_df = logs_df.withColumn('endpoint', regexp_extract('value', method_uri_protocol_pattern, 2))
-        logs_df = logs_df.withColumn('protocol', regexp_extract('value', method_uri_protocol_pattern, 3))
-        logs_df = logs_df.withColumn('status', regexp_extract('value', status_pattern, 1).cast('integer'))
-        logs_df = logs_df.withColumn('content_size', regexp_extract('value', content_size_pattern, 1).cast('integer'))
-
-        # Add columns for year, month, and date
-        logs_df = logs_df.withColumn('year', year(logs_df['timestamp']))
-        logs_df = logs_df.withColumn('month', month(logs_df['timestamp']))
-        logs_df = logs_df.withColumn('date', dayofmonth(logs_df['timestamp']))
-
-        # Add columns for hour, minute, and second
-        logs_df = logs_df.withColumn('hour', hour(logs_df['timestamp']))
-        logs_df = logs_df.withColumn('minute', minute(logs_df['timestamp']))
-        logs_df = logs_df.withColumn('second', second(logs_df['timestamp']))
-
-        # Print the transformed DataFrame
-        logs_df.show(10, truncate=True)
-
-        # Store the transformed DataFrame as Parquet files
-        logs_df.write.parquet('logs.parquet')
-
-        # Store the Parquet files in HDFS
-        # writes the transformed DataFrame to the local filesystem as Parquet files with the name logs.parquet. 
-        # These Parquet files are created in the same directory where the consumer.py script is executed.
-        logs_df.write.parquet('hdfs://localhost:9000/logs.parquet')
-
-        # Download the processed DataFrame as CSV
-        logs_df.write.csv('processed_logs.csv')
+from pyspark.sql.functions import col, regexp_extract
+from pyspark.sql.types import *
+from datetime import datetime, timedelta
+from hdfs import InsecureClient
 
 
-
-def get_kafka_stream(consumer):
-    num = 0
-    while True:
-        try:
-            message = consumer.poll(1.0)  # Poll for a single message
-            if not message: 
-                print("no msg")
-                continue
-            if message.error():
-                print("Consumer error: {}".format(message.error()))
-                continue
-            num += 1
-            print("before",num)
-            yield message.value().decode('utf-8')
-            print("after",num)
-
-        except KeyboardInterrupt:
-            break
-
+# Kafka consumer settings
+kafka_bootstrap_servers = 'localhost:9092'
+kafka_topic = 'log_lines_topic'
+kafka_group_id = 'spark-streaming-consumer-group'
 
 # Create a SparkSession
-spark = SparkSession.builder.appName('KafkaConsumer').getOrCreate()
+spark = SparkSession.builder.appName("KafkaConsumerSparkStreaming").getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
 
-# Create a StreamingContext with a batch interval of 10 seconds
-ssc = StreamingContext(spark.sparkContext, 10)
-
-# Set up the Kafka consumer
-conf = {
-    'bootstrap.servers': brokers,  # Kafka broker address
-    'group.id': 'python-consumer',
-    'auto.offset.reset': 'earliest',
-    'api.version.request': True
+# Define the Kafka source options
+kafka_options = {
+    "kafka.bootstrap.servers": kafka_bootstrap_servers,
+    "subscribe": kafka_topic,
+    "startingOffsets": "latest",
 }
-consumer = Consumer(conf)
-print('Kafka Consumer has been initiated...')
 
-# Determine the name of the topic that should be consumed and subscribe to it.
-print('Available topics to consume: ', consumer.list_topics().topics)
+# Read the Kafka stream using spark.readStream
+df = spark.readStream.format("kafka").options(**kafka_options).load()
 
-# Subscribe to the Kafka topic
-consumer.subscribe([topic])
-print('Subscribed to topic: ', topic)
+# Convert the binary message value to string
+df = df.withColumn("value", col("value").cast("string"))
 
-# Create a Kafka stream
-kafka_stream = ssc.queueStream([consumer])
-print('Kafka Stream created...')
+# Extract the desired fields from the log line
+df = df.withColumn(
+    "ip_address",
+    regexp_extract(col("value"), r'^([\d.]+)', 1)
+).withColumn(
+    "timestamp",
+    regexp_extract(col("value"), r'\[([^:]+)', 1)
+).withColumn(
+    "year",
+    regexp_extract(col("timestamp"), r'(\d{4})', 1)
+).withColumn(
+    "month",
+    regexp_extract(col("timestamp"), r'\w{3}', 0)
+).withColumn(
+    "day",
+    regexp_extract(col("timestamp"), r'(\d{2})', 1)
+).withColumn(
+    "hour",
+    regexp_extract(col("timestamp"), r'(\d{2}):(\d{2}):(\d{2})', 1)
+).withColumn(
+    "minute",
+    regexp_extract(col("timestamp"), r'(\d{2}):(\d{2}):(\d{2})', 2)
+).withColumn(
+    "method",
+    regexp_extract(col("value"), r'\"(\w+)', 1)
+).withColumn(
+    "endpoint",
+    regexp_extract(col("value"), r'\"(?:[A-Z]+\s)?(\S+)', 1)
+).withColumn(
+    "http_version",
+    regexp_extract(col("value"), r'HTTP/(\d+\.\d+)', 1)
+).withColumn(
+    "response_code",
+    regexp_extract(col("value"), r'\s(\d{3})\s', 1)
+).withColumn(
+    "bytes",
+    regexp_extract(col("value"), r'\s(\d+)$', 1)
+)
 
-# Process the Kafka stream
-kafka_stream.foreachRDD(lambda rdd: process_logs(rdd))
+# Select the desired columns
+parsed_df = df.select("ip_address", "year", "month", "day", "hour", "minute", "method", "endpoint", "http_version", "response_code", "bytes")
 
-# Convert the generator into an RDD
-# kafka_rdd = spark.sparkContext.parallelize(get_kafka_stream(consumer))
-# print('Converted the generator into an RDD...')
+# Process the Kafka messages and write to console and text file
+query = parsed_df.writeStream.outputMode("append").format("console").start()
 
-# # Create a Kafka stream
-# kafka_stream = ssc.queueStream([kafka_rdd])
-# # kafka_stream = ssc.queueStream([get_kafka_stream(consumer)])
-# print('Kafka Stream created...')
+# Set the current time as the start time
+start_time = datetime.now()
 
-# # Get the log lines from the Kafka stream
-# # Consume and process the messages using the generator function
-# lines = kafka_stream.flatMap(lambda x: x.split('\n'))
+while query.isActive:
+    # Check if no messages have been received for 10 seconds
+    elapsed_time = datetime.now() - start_time
+    if elapsed_time > timedelta(seconds=10):
+        query.stop()
 
-# # Process the messages further (example: print the messages)
-# lines.pprint(num=10)  # Limit the output to 10 lines
+local_path = '/tmp/output/logs/'
 
-# lines.foreachRDD(lambda rdd: process_logs(rdd))
+w_query = parsed_df.writeStream.format("parquet").outputMode("append").option("checkpointLocation", '/tmp/output/ch').option("path", local_path).start()
 
-# Start the streaming context
-ssc.start()
-ssc.awaitTermination()
+
+query.awaitTermination()
